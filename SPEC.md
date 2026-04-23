@@ -281,25 +281,107 @@ Resolved (see "Integration surface"):
   behind `FunctionToolCallback`) and transform its output rather than
   building our own.
 
-Still open:
+### 1. Session identity for Strategy 3 — resolved
 
-1. **Session identity for Strategy 3.** Candidates: chat-memory
-   conversation id (if the app uses `ChatMemory`), a stable key in the
-   advisor context, or a caller-supplied id. Proposal: default to the
-   chat-memory conversation id when present, fall back to a
-   per-`ChatClient` scope; let apps override via a
-   `Function<ChatClientRequest, String>` bean.
-2. **Interaction with `ToolCallAdvisor`'s recursion.** Our advisor runs
-   once per turn, but the tool loop re-drives the downstream chain.
-   Confirm (by reading the `ToolCallAdvisor` source and writing a
-   round-trip test) that our synthesized tools — which are already in
-   `ChatOptions` — remain attached across loop iterations and aren't
-   duplicated or dropped.
-3. **Heuristic calibration for Strategy 1.** Needs a real corpus of
-   tools; pick 2–3 reference apps (e.g. a CRM-style MCP server plus
-   one of the Spring AI sample apps) to tune the
-   `*Id`/`*Key`/`*Uuid` name rules and the scalar-type allow-list.
-4. **Interplay with Dynamic Tool Discovery / Tool Search.** Spring AI
-   has work on tool-search / dynamic discovery. Decide whether folding
-   runs before or after any such selector, and whether synthesized
-   tools should be retrieval-indexed alongside the real ones.
+Decision: default to `ChatMemory.CONVERSATION_ID` (the standard advisor-
+context key Spring AI memory advisors already populate); if it's absent,
+Strategy 3 is a no-op for that request and we log a one-shot warning.
+
+- SPI: `SessionIdResolver { Optional<String> resolve(ChatClientRequest) }`.
+- Default resolver reads `ChatMemory.CONVERSATION_ID` from the advisor
+  context.
+- No fallback to "the `ChatClient` instance" — that would silently
+  cross-contaminate observations between users. Honest failure beats
+  privacy-unsafe defaults.
+- Apps that don't use `ChatMemory` can register a custom resolver
+  (e.g. pulling from `RequestAttributes`, an explicit header, etc.) to
+  opt in.
+- The session key is also what the promoted-tools store is keyed on, so
+  overriding it automatically relocates the learning scope.
+
+### 2. Interaction with `ToolCallAdvisor`'s recursion — resolved
+
+Decision: no design change needed; validated via test. Rationale:
+
+- `ToolCallAdvisor` relies on
+  `ToolCallingChatOptions.internalToolExecutionEnabled(false)` and
+  reuses the same `ChatOptions` (and therefore the same
+  `toolCallbacks` list) across loop iterations. Our synthesized tools
+  are added once in `FoldingToolsAdvisor` and stay attached.
+- A `SynthesizedToolCallback` invokes underlying real `ToolCallback`s
+  directly (plain Java method calls), not through the
+  `ToolCallingManager`. So the `ObservingToolCallingManager` sees only
+  the tools the *model* requested, synthesized or real — which is
+  exactly the signal Strategy 3 wants. The pattern detector filters out
+  synthesized-tool observations (we already know their composition).
+- Convert this into a concrete test plan instead of a design question:
+  an integration test that runs ≥ 3 tool round-trips with one
+  synthesized tool in play and asserts (a) it remains visible in each
+  iteration's request, (b) it isn't duplicated, (c) observation records
+  only the model-initiated calls.
+
+### 3. Heuristic calibration for Strategy 1 — resolved (starting rules + plan)
+
+Starting defaults (conservative, explicitly opt-in beyond this):
+
+- Parameter-name regex: `.*(Id|Uuid|Key|Code)$` (case-insensitive).
+- Parameter types allowed: `String`, `UUID`, numeric primitives/boxed,
+  enums.
+- Tool-name regex for automatic listification: `(get|find|fetch|lookup|read|resolve).*`.
+  Any other shape requires an explicit `@Foldable(listify = true)`.
+- Max list size in synthesized schema: 100.
+- Dispatch: `SEQUENTIAL` by default; `PARALLEL` requires explicit
+  opt-in per tool.
+
+Calibration plan:
+
+- Reference corpora: (a) `spring-ai-community/spring-ai-tool-search-tool`
+  demo's synthetic tool set (public, large, diverse), (b) the GitHub MCP
+  tool set exposed in this environment (real-world, lookup-heavy),
+  (c) one Spring AI sample app with classic CRUD tools.
+- Metrics to track per corpus: listify candidates identified,
+  false-positive rate (listified tools whose semantics change under
+  batching — needs human review), false-negative rate (genuine
+  candidates missed).
+- Ship v0 with the defaults above and a `--dry-run` mode in the
+  advisor that logs candidates without registering them, so users can
+  tune against their own corpus.
+
+### 4. Interplay with dynamic tool search — resolved
+
+Dynamic tool discovery is already a recursive advisor
+(`ToolSearchToolCallAdvisor` in
+`spring-ai-community/spring-ai-tool-search-tool`). It indexes the full
+tool catalog, exposes only a `tool_search` tool to the model, and
+materializes matched tools on subsequent turns.
+
+Decision: folding and tool search are complementary — fold first,
+search second.
+
+- `FoldingToolsAdvisor` runs at a low order (before
+  `ToolSearchToolCallAdvisor`). Strategies 1 and 2 produce synthesized
+  `ToolCallback`s that are added to the full catalog the search indexer
+  sees, so the model can discover them via `tool_search` like any
+  other tool.
+- Strategy 3 promotions are also handed to the indexer (via the same
+  advisor context / provider extension point), scoped to the session
+  key from question #1. Retrieval and folding both benefit from the
+  session boundary.
+- If an app uses tool search, folding's value shifts: Strategies 1 & 2
+  reduce the round-trip count *once a fold is selected*; they don't
+  directly reduce the in-prompt token count (tool search already does
+  that). Strategy 3's value grows, because patterns observed under a
+  retrieved subset still promote useful composites.
+- Document the recommended order
+  (`FoldingToolsAdvisor` < `ToolSearchToolCallAdvisor` <
+  `ToolCallAdvisor`) and provide a Spring Boot auto-configuration that
+  sets it when both libraries are on the classpath.
+
+### Remaining (genuinely open)
+
+- Whether `FoldingToolsStore` (cross-session persistence for Strategy 3)
+  should ship as a v0.x extension module or wait for real demand. Leave
+  the SPI hole, decide later.
+- Exact shape of the `@Foldable` annotation (method- vs parameter-level,
+  interaction with `@Tool` / `@ToolParam`). Needs a dry run against a
+  real tool class before finalizing.
