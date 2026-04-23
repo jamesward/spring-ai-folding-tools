@@ -19,25 +19,84 @@ mistakes that a deterministic composition could avoid.
 
 ## Integration surface
 
-- Implements `CallAdvisor` (and `StreamAdvisor` where it makes sense) so it
-  composes with `ChatClient.advisors(...)`.
-- Consumes a `ToolCallbackProvider` (or raw `List<ToolCallback>`) and
-  produces a folded `List<ToolCallback>` that is injected into
-  `ChatOptions` before the request is sent.
-- Each synthesized `ToolCallback` owns its own JSON schema and an
-  invocation handler that delegates to one or more real `ToolCallback`s.
-- Configuration via a `FoldingToolsProperties` class and Spring Boot
-  auto-configuration; individual strategies can be toggled independently.
+We need two distinct hooks into Spring AI, and the framework gives us
+clean ones for each:
+
+1. **Outbound tool-list rewriting.** A `CallAdvisor` (and `StreamAdvisor`)
+   whose `adviseCall(ChatClientRequest, CallAdvisorChain)` mutates the
+   request's `ChatOptions.toolCallbacks` before delegating. This is where
+   Strategies 1 and 2 add synthesized `ToolCallback`s, and where
+   Strategy 3 attaches session-promoted tools on subsequent turns.
+
+2. **Per-tool-call observation.** Spring AI 1.1 ships a recursive
+   `ToolCallAdvisor` that pulls the tool-calling loop out of each
+   `ChatModel` and into the advisor chain, dispatching via a
+   configurable `ToolCallingManager`. We wire in an
+   `ObservingToolCallingManager` that wraps the default manager and
+   records `(toolName, args, result)` for Strategy 3's pattern detector.
+   No custom loop to maintain — just a decorator on the manager.
+
+Synthesized tools don't need any special dispatch support. Each
+`SynthesizedToolCallback` holds references to the underlying real
+`ToolCallback`s and does the fan-out / composition in its own `call()`.
+The framework's default `ToolCallingManager` will look it up by name
+and invoke it like any other tool.
+
+### Ordering in the advisor chain
+
+Spring AI advisors run in `getOrder()` order (lowest first on the
+request side). Our placement:
+
+- `FoldingToolsAdvisor` — low order, runs before `ToolCallAdvisor`.
+  Mutates `ChatOptions.toolCallbacks` once per turn; sees the final
+  response on the way back.
+- `ToolCallAdvisor` — built with our `ObservingToolCallingManager`.
+  Because it is recursive (`chain.copy(this).nextCall(...)`), each
+  tool round-trip re-drives downstream advisors, so observation and
+  any future per-round-trip behavior remain composable.
+
+### Artifacts we'll produce
+
+- `FoldingToolsAdvisor implements CallAdvisor, StreamAdvisor`
+- Strategy SPI: `FoldingStrategy { List<ToolCallback> fold(FoldingContext) }`
+  with implementations `AutoListifyStrategy`, `AutoAggregateStrategy`,
+  `ObserveAndCreateStrategy`
+- `SynthesizedToolCallback` — a `ToolCallback` whose `ToolDefinition` is
+  programmatically built (name, description, JSON-schema string) and
+  whose `call(String)` delegates to underlying callbacks
+- `ObservingToolCallingManager implements ToolCallingManager` — wraps
+  the default; feeds observations into a per-session buffer
+- `FoldingToolsProperties` + Spring Boot auto-configuration; strategies
+  independently toggleable
 
 ```
 ChatClient
-  └── FoldingToolsAdvisor
-        ├── Strategy: AutoListify
-        ├── Strategy: AutoAggregate
-        └── Strategy: ObserveAndCreate
-        → rewrites ChatOptions.toolCallbacks
-        → intercepts tool calls, dispatches to real tools
+  └── advisors (in order)
+        ├── FoldingToolsAdvisor              ← Strategies 1 & 2 inject
+        │     → rewrites ChatOptions.toolCallbacks
+        │       · adds listified variants
+        │       · adds static aggregates
+        │       · adds session-promoted tools (from Strategy 3)
+        ├── ... user advisors ...
+        └── ToolCallAdvisor
+              └── ObservingToolCallingManager ← Strategy 3 observes
+                    → default ToolCallingManager
+                      · dispatches synthesized tools (they fan out internally)
+                      · dispatches real tools (observations recorded)
 ```
+
+### Reuse of Spring AI internals
+
+- **JSON-schema generation:** reuse Spring AI's existing schema generator
+  (the one behind `FunctionToolCallback` / `MethodToolCallback`) so
+  synthesized schemas match the dialect the providers expect. For
+  listified/aggregated schemas, start from the generator's output for
+  the underlying type and transform it (wrap in array, union of fields)
+  rather than rolling our own generator.
+- **Tool construction:** prefer `FunctionToolCallback.builder(...)` /
+  a `ToolDefinition.builder()` path for synthesized tools rather than a
+  hand-rolled `ToolCallback` subclass, so we inherit future framework
+  changes (e.g. metadata, approval hooks) for free.
 
 ## Strategy 1 — Auto listification
 
@@ -210,14 +269,37 @@ spring-ai-folding-tools/
   integration is stable enough to introspect.
 - Model-assisted naming/descriptions for synthesized tools.
 
-## Open design questions to resolve next
+## Open design questions
 
-1. Where exactly in Spring AI's advisor chain should we sit so we can
-   both rewrite the outbound tool list and intercept tool calls? Confirm
-   against the current `CallAdvisor` API.
-2. Can we piggy-back on Spring AI's existing JSON-schema generation for
-   synthesized tools, or do we need our own?
-3. What's the right identity for a "session" in Strategy 3 — chat memory
-   id, advisor instance, something else?
-4. Default heuristics for Strategy 1 need a real corpus of tools to
-   calibrate; pick 2–3 reference apps for this.
+Resolved (see "Integration surface"):
+
+- ~~Advisor-chain placement.~~ `CallAdvisor` for outbound tool-list
+  rewriting, ordered before `ToolCallAdvisor`; an
+  `ObservingToolCallingManager` plugged into `ToolCallAdvisor` for
+  per-call observation.
+- ~~Schema generation.~~ Reuse Spring AI's built-in generator (the one
+  behind `FunctionToolCallback`) and transform its output rather than
+  building our own.
+
+Still open:
+
+1. **Session identity for Strategy 3.** Candidates: chat-memory
+   conversation id (if the app uses `ChatMemory`), a stable key in the
+   advisor context, or a caller-supplied id. Proposal: default to the
+   chat-memory conversation id when present, fall back to a
+   per-`ChatClient` scope; let apps override via a
+   `Function<ChatClientRequest, String>` bean.
+2. **Interaction with `ToolCallAdvisor`'s recursion.** Our advisor runs
+   once per turn, but the tool loop re-drives the downstream chain.
+   Confirm (by reading the `ToolCallAdvisor` source and writing a
+   round-trip test) that our synthesized tools — which are already in
+   `ChatOptions` — remain attached across loop iterations and aren't
+   duplicated or dropped.
+3. **Heuristic calibration for Strategy 1.** Needs a real corpus of
+   tools; pick 2–3 reference apps (e.g. a CRM-style MCP server plus
+   one of the Spring AI sample apps) to tune the
+   `*Id`/`*Key`/`*Uuid` name rules and the scalar-type allow-list.
+4. **Interplay with Dynamic Tool Discovery / Tool Search.** Spring AI
+   has work on tool-search / dynamic discovery. Decide whether folding
+   runs before or after any such selector, and whether synthesized
+   tools should be retrieval-indexed alongside the real ones.
