@@ -186,6 +186,38 @@ re-deriving them from docs/jars burns a lot of time.
   cache" in v0. A `FoldingToolsStore` impl (out-of-scope) could cache
   promotions durably; the current design leaves that door open.
 
+## Autoconfiguration decisions
+
+- **Autoconfig shipped in the same module.** Earlier non-goal reversed:
+  autoconfig turned out to be ~100 lines and the bean wiring was worth
+  having before more strategies land. `spring-boot-autoconfigure` is a
+  `<optional>true</optional>` dep so pure-Java consumers don't pull
+  Boot transitively.
+- **Registered via `META-INF/spring/…AutoConfiguration.imports`** (the
+  Boot 3.x mechanism, not the legacy `spring.factories`).
+- **Strategy beans are individually toggleable** via
+  `spring.ai.folding-tools.{listify|aggregate|observe}.enabled`.
+  `listify` and `aggregate` default to on; `observe` defaults to off
+  because it requires a chat-memory session id to produce anything
+  useful.
+- **`AggregationHint` beans auto-collected.** The autoconfig uses
+  `ObjectProvider<AggregationHint>` and passes the stream into
+  `AutoAggregateStrategy`'s constructor, so apps declare hints as
+  individual `@Bean` methods rather than assembling a `List`.
+- **`Properties` extends `FoldingToolsProperties`** as a static nested
+  class with `@ConfigurationProperties("spring.ai.folding-tools")`.
+  Separating the annotated type from the core type keeps
+  `FoldingToolsProperties` usable without Spring Boot on the
+  classpath.
+- **`ObservingToolCallingManager` exposed as its own bean type, not
+  as `ToolCallingManager`.** Prevents accidental replacement of the
+  framework default. Apps wire it into their `ToolCallAdvisor`
+  explicitly.
+- **User beans override defaults** — `SessionIdResolver` and
+  `SessionObservationStore` are both `@ConditionalOnMissingBean`, so
+  providing a custom bean silently replaces the default without
+  ordering fuss.
+
 ## v0 non-goals (will need design work before we attempt them)
 
 - **`ToolContext` propagation into synthesized dispatch.**
@@ -197,8 +229,6 @@ re-deriving them from docs/jars burns a lot of time.
   `Executor` + bounded concurrency + per-tool opt-in.
 - **Persistent / cross-session learning** for Strategy 3. The SPI hole
   exists (`SessionObservationStore`) but no durable impl ships in v0.
-- **Spring Boot auto-configuration.** Keeping `core` pure-Java until
-  the SPIs stabilize.
 - **Cost-aware folding.** Needs measured token/latency history.
 - **Folding across MCP tool servers.** Blocked on Spring AI's MCP
   introspection story being stable.
