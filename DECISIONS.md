@@ -144,6 +144,48 @@ re-deriving them from docs/jars burns a lot of time.
 - **Jackson ObjectMapper shared static.** Thread-safe by contract;
   avoids per-call allocation hot path.
 
+## Strategy 3 (ObserveAndCreate) decisions
+
+- **Reuses `ChainSynthesizer`.** Strategy 2 and Strategy 3 emit the
+  same shape of synthesized tool (two-step A → B); only the binding
+  source differs. Extracting `ChainSynthesizer` keeps both strategies
+  small and avoids two copies of the dispatch logic drifting apart.
+- **Match = exact JSON value equality.** A binding is counted only
+  when the actual value in the later tool's args equals the value at
+  some top-level field in the earlier tool's result. Stronger signal
+  than name-matching alone (rules out coincidental field names); v0
+  accepts this at the cost of missing bindings that went through
+  string formatting / type coercion.
+- **Top-level fields only.** Nested extraction is deferred — would
+  need a path notation, which enlarges the hint/binding shape.
+- **No cross-session mixing.** The strategy operates on observations
+  already filtered to the current session by `FoldingToolsAdvisor` —
+  the strategy itself is session-agnostic. Keeping session scoping at
+  the advisor is important so per-session eviction in the store works.
+- **Synthesized-tool observations ignored.** Tools present in
+  `sourceTools` as a `SynthesizedToolCallback` get their names added
+  to a skip set; observations of those tools don't feed the pattern
+  detector. Prevents learning composites of our own composites.
+- **Observations of unknown tools ignored.** A tool that was observed
+  earlier but is no longer in `sourceTools` can't be composed anyway,
+  so its observations are dropped at parse time.
+- **Self-loops skipped.** A pair (A, A) is skipped before field
+  matching runs — saves work and rules out "ping echoes its token"
+  degenerate patterns.
+- **`min=2` default, 1 allowed via config.** Two occurrences is the
+  threshold from the spec. Config lets tests and paranoid prod
+  settings tune either direction; 0 is clamped to 1 defensively.
+- **`O(N²)` pair scan is fine for v0.** Per-session observation buffer
+  is bounded (default 256); the scan runs once per turn. If this shows
+  up in profiles later, candidate optimizations are: hash the later
+  tool's arg values first, then stream earlier tools' result fields
+  through the hash.
+- **Produced tools live only for the current turn's fold pass.** The
+  advisor re-runs folding each turn, so observations accumulate in the
+  store and promotions get re-derived. No separate "promoted tools
+  cache" in v0. A `FoldingToolsStore` impl (out-of-scope) could cache
+  promotions durably; the current design leaves that door open.
+
 ## v0 non-goals (will need design work before we attempt them)
 
 - **`ToolContext` propagation into synthesized dispatch.**
